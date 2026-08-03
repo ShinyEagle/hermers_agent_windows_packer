@@ -1,2 +1,3 @@
 # hermers_agent_windows_packer
-Pack hermers agent to a single package 
+
+A GitHub workflow repository for packaging the Windows native Hermes into a ready-to-use compressed archive.
