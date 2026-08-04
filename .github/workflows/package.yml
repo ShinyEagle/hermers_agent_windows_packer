@@ -1,0 +1,300 @@
+name: Build and Release Hermes Agent
+
+on:
+  # Check for new hermes-agent releases every hour
+  schedule:
+    - cron: '0 * * * *'  # Every hour at minute 0
+  
+  # Manual trigger for testing or specific versions
+  workflow_dispatch:
+    inputs:
+      hermes_branch:
+        description: 'hermes-agent branch to clone'
+        required: false
+        default: 'main'
+      hermes_tag:
+        description: 'hermes-agent tag (overrides branch)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write  # needed for creating releases
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # ── Step 1: Determine version to build ──────────────────────
+      - name: Determine version to build
+        id: version
+        shell: pwsh
+        run: |
+          # For manual triggers, use the provided tag/branch
+          if ("${{ github.event.inputs.hermes_tag }}") {
+            $version = "${{ github.event.inputs.hermes_tag }}"
+            $ref = "${{ github.event.inputs.hermes_tag }}"
+            $releaseUrl = "https://github.com/shineeagle/hermes-agent/releases/tag/$version"
+            Write-Host "Manual trigger: using tag $version"
+          } elseif ("${{ github.event.inputs.hermes_branch }}") {
+            $version = "${{ github.event.inputs.hermes_branch }}"
+            $ref = "${{ github.event.inputs.hermes_branch }}"
+            $releaseUrl = "https://github.com/shineeagle/hermes-agent/tree/$version"
+            Write-Host "Manual trigger: using branch $version"
+          } else {
+            # For scheduled runs, find the latest unbuilt release after 2026-08-01
+            Write-Host "Scheduled/manual (no input): finding latest unbuilt release after 2026-08-01..."
+            
+            # Get releases from hermes-agent
+            $allReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/shineeagle/hermes-agent/releases?per_page=30" -Headers @{Accept="application/vnd.github.v3+json"}
+            
+            # Filter: only stable releases after 2026-08-01 00:00:00 UTC
+            $cutoffDate = [DateTime]::Parse("2026-08-01T00:00:00Z")
+            $stableReleases = $allReleases | Where-Object { 
+              -not $_.prerelease -and 
+              [DateTime]::Parse($_.published_at) -ge $cutoffDate 
+            } | Sort-Object published_at -Descending
+            
+            Write-Host "Found $($stableReleases.Count) stable releases after 2026-08-01"
+            
+            if ($stableReleases.Count -eq 0) {
+              Write-Host "No releases found after 2026-08-01"
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              exit 0
+            }
+            
+            # Find the latest one that doesn't have a Windows build yet
+            $found = $false
+            foreach ($release in $stableReleases) {
+              $tag = $release.tag_name
+              $publishedAt = [DateTime]::Parse($release.published_at).ToString("yyyyMMdd")
+              $windowsTag = "hermes-agent-windows-$publishedAt-$tag"
+              
+              # Check if this Windows build already exists
+              $existing = gh release view $windowsTag 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                # This release doesn't have a Windows build yet
+                $version = $tag
+                $ref = $tag
+                $releaseUrl = $release.html_url
+                Write-Host "Found unbuilt release: $version (published: $($release.published_at))"
+                $found = $true
+                break
+              } else {
+                Write-Host "  ✓ $tag already built"
+              }
+            }
+            
+            if (-not $found) {
+              Write-Host "✅ All releases after 2026-08-01 have been built"
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              exit 0
+            }
+          }
+          
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "releaseUrl=$releaseUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # ── Step 1b: Check if release already exists (skip for scheduled runs) ──
+      - name: Check if release already exists
+        id: check
+        if: github.event_name == 'schedule'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $date = Get-Date -Format "yyyyMMdd"
+          $releaseTag = "hermes-agent-windows-$date-$version"
+          
+          # Check if this release already exists
+          $existing = gh release view $releaseTag 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "✅ Release $releaseTag already exists, skipping build"
+            "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Host "🆕 Release $releaseTag does not exist, proceeding with build"
+            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      # ── Step 2: Checkout this repo (hermes-agent) ───────────────
+      - name: Checkout hermes-agent repository
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.ref }}
+
+      # ── Step 3: Verify install.ps1 integrity ───────────────────
+      - name: Verify install.ps1 integrity
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          # Download the official install.ps1
+          Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.ps1" `
+            -OutFile "official-install.ps1"
+
+          $localHash = (Get-FileHash -Path ".\install.ps1" -Algorithm SHA256).Hash
+          $officialHash = (Get-FileHash -Path ".\official-install.ps1" -Algorithm SHA256).Hash
+
+          Write-Host "Local install.ps1:    $localHash"
+          Write-Host "Official install.ps1: $officialHash"
+
+          if ($localHash -ne $officialHash) {
+            Write-Error "install.ps1 hash mismatch! The repo script has been modified."
+            exit 1
+          }
+          Write-Host "✅ install.ps1 integrity verified"
+
+      # ── Step 4: Prepare hermes directory and tools ─────────────
+      - name: Prepare hermes directory and download tools
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $RootDir = "${{ github.workspace }}"
+          $HermesDir = "$RootDir\hermes"
+          $ToolsDir  = "$HermesDir\tools"
+
+          New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
+
+          # --- Download latest ripgrep ---
+          $rgRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/BurntSushi/ripgrep/releases/latest"
+          $rgVersion = $rgRelease.tag_name -replace '^v', ''
+          $rgAsset = $rgRelease.assets | Where-Object { $_.name -match "x86_64-pc-windows-msvc\.zip$" }
+          Write-Host "Downloading ripgrep $rgVersion ..."
+          Invoke-WebRequest -Uri $rgAsset.browser_download_url -OutFile "ripgrep.zip"
+          Expand-Archive -Path "ripgrep.zip" -DestinationPath "$ToolsDir\ripgrep-tmp" -Force
+          # Flatten: move the inner folder content to tools\ripgrep
+          $innerDir = Get-ChildItem "$ToolsDir\ripgrep-tmp" -Directory | Select-Object -First 1
+          Move-Item -Path $innerDir.FullName -Destination "$ToolsDir\ripgrep"
+          Remove-Item "ripgrep.zip", "$ToolsDir\ripgrep-tmp" -Recurse -Force
+          Write-Host "✅ ripgrep $rgVersion installed"
+
+          # --- Download latest ffmpeg ---
+          $ffRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
+          $ffAsset = $ffRelease.assets | Where-Object { $_.name -match "ffmpeg-master-latest-win64-gpl\.zip$" }
+          if (-not $ffAsset) {
+            # Fallback: try essentials build
+            $ffAsset = $ffRelease.assets | Where-Object { $_.name -match "win64.*gpl.*\.zip$" } | Select-Object -First 1
+          }
+          Write-Host "Downloading ffmpeg ..."
+          Invoke-WebRequest -Uri $ffAsset.browser_download_url -OutFile "ffmpeg.zip"
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "$ToolsDir\ffmpeg-tmp" -Force
+          $innerDir = Get-ChildItem "$ToolsDir\ffmpeg-tmp" -Directory | Select-Object -First 1
+          Move-Item -Path $innerDir.FullName -Destination "$ToolsDir\ffmpeg"
+          Remove-Item "ffmpeg.zip", "$ToolsDir\ffmpeg-tmp" -Recurse -Force
+          Write-Host "✅ ffmpeg installed"
+
+      # ── Step 5: Install Hermes Agent ────────────────────────────
+      - name: Install Hermes Agent
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $RootDir = "${{ github.workspace }}"
+
+          # Clean PATH — only essential Windows system paths
+          $env:Path = @(
+            "C:\WINDOWS\system32",
+            "C:\WINDOWS",
+            "C:\WINDOWS\System32\Wbem",
+            "C:\WINDOWS\System32\WindowsPowerShell\v1.0",
+            "C:\WINDOWS\System32\OpenSSH",
+            "$RootDir\hermes\tools\ripgrep",
+            "$RootDir\hermes\tools\ffmpeg"
+          ) -join ";"
+
+          $env:HERMES_HOME = "$RootDir\hermes"
+          Write-Host "HERMES_HOME = $env:HERMES_HOME"
+          Write-Host "PATH = $env:Path"
+
+          # install.new.ps1 is at the workspace root (this repo IS hermes-agent)
+          & pwsh -ExecutionPolicy Bypass -File "$RootDir\install.new.ps1" -IncludeDesktop
+          if ($LASTEXITCODE -ne 0) {
+            throw "install.new.ps1 failed with exit code $LASTEXITCODE"
+          }
+
+      # ── Step 6: Copy extra files into hermes package ───────────
+      - name: Prepare package contents
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $RootDir = "${{ github.workspace }}"
+          $HermesDir = "$RootDir\hermes"
+
+          # Copy launcher script to root of package
+          if (Test-Path "$RootDir\hermes-launch.ps1") {
+            Copy-Item "$RootDir\hermes-launch.ps1" "$HermesDir\hermes-launch.ps1" -Force
+          }
+
+          # Add any other files you want in the package here:
+          # Copy-Item "$RootDir\extra-config.json" "$HermesDir\" -Force
+
+          Write-Host "Package directory contents:"
+          Get-ChildItem $HermesDir -Depth 1 | Format-Table Name, Length, LastWriteTime
+
+      # ── Step 7: Package with 7z ────────────────────────────────
+      - name: Package with 7z
+        if: steps.check.outputs.skip != 'true'
+        id: package
+        shell: pwsh
+        run: |
+          $RootDir = "${{ github.workspace }}"
+          $HermesDir = "$RootDir\hermes"
+          $version = "${{ steps.version.outputs.version }}"
+
+          $date = Get-Date -Format "yyyyMMdd"
+          # Archive name: hermes-agent-windows-yyyyMMdd-{tag-or-sha}.7z
+          $archiveName = "hermes-agent-windows-$date-$version.7z"
+
+          # 7z is pre-installed on windows-latest runners
+          & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=9 `
+            "$RootDir\$archiveName" "$HermesDir\*"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "7z compression failed"
+          }
+
+          # Store archive name for subsequent steps.
+          "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $size = (Get-Item "$RootDir\$archiveName").Length / 1MB
+          Write-Host "✅ Created $archiveName ($([math]::Round($size, 1)) MB)"
+
+      # ── Step 8: Upload artifact ─────────────────────────────────
+      - name: Upload build artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-agent-windows-x64
+          path: ${{ github.workspace }}\${{ steps.package.outputs.archive_name }}
+          retention-days: 7
+
+      # ── Step 9: Create Release ──────────────────────────────────
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $date = Get-Date -Format "yyyyMMdd"
+          $version = "${{ steps.version.outputs.version }}"
+          $archive = "${{ steps.package.outputs.archive_name }}"
+          $releaseUrl = "${{ steps.version.outputs.releaseUrl }}"
+          
+          # Release tag format: hermes-agent-windows-yyyyMMdd-{version}
+          $releaseTag = "hermes-agent-windows-$date-$version"
+          $releaseTitle = "Hermes Agent Windows $date ($version)"
+
+          # Check if this exact release already exists
+          $existing = gh release view $releaseTag 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $releaseTag already exists, uploading to it"
+            gh release upload $releaseTag "$archive" --clobber
+          } else {
+            Write-Host "Creating new release: $releaseTag"
+            gh release create $releaseTag "$archive" `
+              --title $releaseTitle `
+              --notes "Automated Windows build for hermes-agent $version`n`n**Source Release:** $releaseUrl`n`nBuilt with install.new.ps1 -IncludeDesktop`n`nArchive: $archive"
+          }
+
+          Write-Host "✅ Release published: $releaseTag"
