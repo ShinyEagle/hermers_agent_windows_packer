@@ -16,14 +16,18 @@ if (-not $toolPaths) {
 $extraPath = $toolPaths -join ";"
 
 # Command that the new PowerShell window will execute on startup:
-#   1. Append tool paths to its own PATH
-#   2. Set working directory to the package root
-#   3. Print a confirmation banner
+#   1. Set HERMES_HOME to the package root
+#   2. Append tool paths to its own PATH
+#   3. Set working directory to the package root
+#   4. Print a confirmation banner
 $initCommand = @"
+`$env:HERMES_HOME = '$scriptDir';
 `$env:Path += ';$extraPath';
 Set-Location '$scriptDir';
-Write-Host 'Hermes tools added to PATH:' -ForegroundColor Green;
-$($toolPaths | ForEach-Object { "Write-Host '  $_' -ForegroundColor DarkGray" } | Out-String)
+Write-Host 'Hermes environment configured:' -ForegroundColor Green;
+Write-Host "  HERMES_HOME: `$env:HERMES_HOME" -ForegroundColor DarkGray;
+Write-Host '  Tools added to PATH:' -ForegroundColor DarkGray;
+$($toolPaths | ForEach-Object { "Write-Host '    $_' -ForegroundColor DarkGray" } | Out-String)
 Write-Host '';
 "@
 

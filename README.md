@@ -58,7 +58,7 @@ hermers_agent_windows_packer/
 ### Built Package (after extraction)
 
 ```
-hermes/
+$HERMES_HOME/hermes/
 ├── hermes-launch.ps1            # Launches Hermes GUI with correct PATH
 ├── tools/
 │   ├── ripgrep/                 # Portable ripgrep (rg.exe)
@@ -81,7 +81,7 @@ hermes/
     └── tools/
         └── skills_sync.py       # Skill synchronization script
 
-%LOCALAPPDATA%\hermes\           # HERMES_HOME (user data)
+$HERMES_HOME\hermes\           # HERMES_HOME (user data)
 ├── .env                         # API keys, model configuration
 ├── SOUL.md                      # AI personality prompt
 ├── skills/                      # Synced skills
@@ -112,12 +112,6 @@ Go to **Actions → Build and Release Hermes Agent → Run workflow**:
 1. Download the latest release from the [Releases page](https://github.com/shineeagle/hermers_agent_windows_packer/releases).
 2. Extract the `.7z` archive to your preferred location (e.g. `C:\Hermes`).
 3. Run `hermes-launch.ps1` — it opens a new PowerShell window with all tools on `PATH` and launches the Hermes desktop GUI.
-4. Alternatively, use the CLI directly:
-   ```powershell
-   # From the extracted package directory
-   .\hermes-agent\venv\Scripts\hermes.exe --help
-   ```
-
 ---
 
 ## Files
@@ -125,8 +119,6 @@ Go to **Actions → Build and Release Hermes Agent → Run workflow**:
 | File | Purpose |
 |------|---------|
 | `package.yml` | GitHub Actions workflow — defines the full build pipeline |
-| `install.new.ps1` | Latest version of the Hermes installer (hash-verified against official) |
-| `install.ps1` | Original/reference installer script |
 | `hermes-launch.ps1` | Portable launcher — sets up PATH and starts the Hermes GUI |
 
 ---
@@ -135,7 +127,7 @@ Go to **Actions → Build and Release Hermes Agent → Run workflow**:
 
 ### Adding More Tools
 
-Edit **Step 3** in `package.yml` to download additional portable tools:
+Edit [**Step 4**](https://github.com/ShinyEagle/hermers_agent_windows_packer/blob/main/.github/workflows/package.yml#L166:L202) in `package.yml` to download additional portable tools:
 
 ```yaml
 # Example: adding a new tool
@@ -146,13 +138,3 @@ Expand-Archive -Path "tool.zip" -DestinationPath "$ToolsDir\tool" -Force
 ```
 
 The tool will be automatically available in the launched PowerShell session since `hermes-launch.ps1` adds all `tools\*` subdirectories to `PATH`.
-
-### Changing the Install Location
-
-Set the `HERMES_HOME` environment variable before running the installer:
-
-```powershell
-$env:HERMES_HOME = "D:\MyHermes"
-```
-
-This changes both the data directory and the install directory.
