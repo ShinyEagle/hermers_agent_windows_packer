@@ -224,7 +224,7 @@ jobs:
           Write-Host "PATH = $env:Path"
 
           # install.new.ps1 is at the workspace root (this repo IS hermes-agent)
-          & pwsh -ExecutionPolicy Bypass -File "$RootDir\install.new.ps1" -IncludeDesktop
+          & powershell -ExecutionPolicy Bypass -File "$RootDir\install.new.ps1" -IncludeDesktop
           if ($LASTEXITCODE -ne 0) {
             throw "install.new.ps1 failed with exit code $LASTEXITCODE"
           }
