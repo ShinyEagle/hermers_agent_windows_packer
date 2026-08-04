@@ -125,8 +125,8 @@ jobs:
         with:
           ref: ${{ steps.version.outputs.ref }}
 
-      # ── Step 3: Verify install.ps1 integrity ───────────────────
-      - name: Verify install.ps1 integrity
+      # ── Step 3: Verify and patch install.ps1 ───────────────────
+      - name: Verify and patch install.ps1
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
         run: |
@@ -145,6 +145,22 @@ jobs:
             exit 1
           }
           Write-Host "✅ install.ps1 integrity verified"
+
+          # Remove the PATH reset line that overwrites environment variables
+          # This line is problematic in CI environments where we need to preserve
+          # the modified PATH with ripgrep and ffmpeg tools
+          $content = Get-Content "official-install.ps1" -Raw
+          $pattern = '\$env:Path\s*=\s*\[Environment\]::GetEnvironmentVariable\("Path",\s*"User"\)\s*\+\s*";"\s*\+\s*\[Environment\]::GetEnvironmentVariable\("Path",\s*"Machine"\)'
+          
+          if ($content -match $pattern) {
+            $content = $content -replace $pattern, '# PATH reset removed by packer workflow'
+            $content | Set-Content "install.new.ps1" -NoNewline
+            Write-Host "✅ Removed PATH reset line from install.ps1"
+            Write-Host "   Saved as install.new.ps1"
+          } else {
+            Write-Warning "PATH reset line not found in install.ps1, using original"
+            Copy-Item "official-install.ps1" "install.new.ps1"
+          }
 
       # ── Step 4: Prepare hermes directory and tools ─────────────
       - name: Prepare hermes directory and download tools
