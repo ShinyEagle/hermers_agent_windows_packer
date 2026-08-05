@@ -1,21 +1,86 @@
+# ============================================================================
+#  Build and Release Hermes Agent (Windows packer)
+# ============================================================================
+#  Produces a self-contained Windows build of hermes-agent and publishes it
+#  as a GitHub Release in *this* repository.
+#
+#  Pipeline overview:
+#    Step 1    Decide which upstream version to build + which build type
+#              (release|debug); skip if nothing new
+#    Step 1b   Skip gate: propagate Step 1's decision; guard against re-runs
+#    Step 2    Check out this repo at the chosen tag/branch
+#    Step 2b   Compute the package name (version or branch-hash)
+#    Step 2c   Restore caches (managed Python, uv cache, npm cache)
+#    Step 3    Verify install.ps1 against the official copy, then patch it
+#    Step 4    Download portable tools (ripgrep, ffmpeg) into hermes\tools
+#    Step 5    Run the patched installer into a clean HERMES_HOME
+#    Step 6    Add extra package files (hermes-launch.ps1)
+#    Step 7    Package TWO archives with 7z: tui = plain official install
+#              (no desktop GUI); gui = desktop built on demand via the
+#              official "install.ps1 -Stage Desktop" stage. debug = as
+#              installed; release = pruned
+#    Step 8    Upload both archives as a build artifact (kept 7 days)
+#    Step 9    Create (or update) the GitHub Release with both archives
+#
+#  Build types (per goals.md):
+#    release  - AUTOMATIC (hourly schedule). Everything not needed at runtime
+#               is removed before packing: dev/test/docs source, dev
+#               dependencies (npm prune --omit=dev), build-time GUI waste,
+#               caches and the .git clone history.
+#    debug    - MANUAL only (workflow_dispatch `debug` toggle). Packaged
+#               directly after installing hermes-agent, nothing is removed.
+#               Intended for testing.
+#
+#  Naming conventions (per goals.md):
+#    Release tag:
+#        hermes_agent-<yyyyMMddHHmmss>-<release|debug>-<version|branch-hash>
+#    Archive names (one per variant; the gui|tui token distinguishes them):
+#        hermes_agent-<yyyyMMddHHmmss>-<release|debug>-<gui|tui>-<version|branch-hash>.7z
+#      - <version>      = the upstream tag, for tag builds (automatic and
+#                         manual-tag builds)
+#      - <branch-hash>  = "<branch>-<short-sha>", for manual branch builds
+#      - <gui|tui>      = gui ships the desktop app; tui is CLI/TUI only
+#      - HH is the 24-hour clock; a 12-hour "hh" would collide between
+#        morning/afternoon builds within the same day.
+#
+#  Design note (IMPORTANT):
+#    The output is a self-contained, ready-to-run Windows application that is
+#    built ENTIRELY FROM SOURCE. It does NOT depend on NousResearch/hermes-agent
+#    publishing any Windows release or binaries: every qualifying upstream
+#    release gets a Windows build, regardless of the assets attached to the
+#    upstream release. The upstream release list is only used to decide WHICH
+#    version to package.
+#
+#  All steps from Step 2 onward are guarded by:
+#    if: steps.check.outputs.skip != 'true'
+# ============================================================================
 name: Build and Release Hermes Agent
 
 on:
-  # Check for new hermes-agent releases every hour
+  # Poll for new upstream hermes-agent releases every hour (at minute 0).
   schedule:
-    - cron: '0 * * * *'  # Every hour at minute 0
+    - cron: '0 * * * *'
   
-  # Manual trigger for testing or specific versions
+  # Manual trigger: build a specific branch or tag on demand.
   workflow_dispatch:
     inputs:
       hermes_branch:
-        description: 'hermes-agent branch to clone'
+        description: 'hermes-agent branch to build (used when hermes_tag is empty)'
         required: false
         default: 'main'
       hermes_tag:
-        description: 'hermes-agent tag (overrides branch)'
+        description: 'hermes-agent tag to build (takes precedence over hermes_branch)'
         required: false
         default: ''
+      # Debug build toggle (goals.md): debug packages are only ever produced by
+      # manually toggling this input. They are packaged directly after install
+      # with NOTHING removed (for testing). The automatic hourly run always
+      # builds the `release` package.
+      debug:
+        description: 'Build a DEBUG package (keep everything, no pruning) for testing'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write  # needed for creating releases
@@ -26,29 +91,61 @@ jobs:
 
     steps:
       # ── Step 1: Determine version to build ──────────────────────
+      # Decides which hermes-agent version this run should package, and which
+      # build type (release|debug) to produce.
+      # Outputs consumed by later steps:
+      #   version    -> the version/tag/branch, used to derive names and ref
+      #   ref        -> git ref checked out in Step 2 (this repo mirrors hermes-agent)
+      #   releaseUrl -> link back to the upstream release, shown in release notes
+      #   skip       -> 'true' when there is nothing to build
+      #   build_type -> 'release' | 'debug' (goals.md: debug = manual toggle only)
+      #   ref_kind   -> 'tag' | 'branch' (chooses <version> vs <branch-hash> naming)
       - name: Determine version to build
         id: version
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # the `gh` calls below must be authenticated
+          # Workflow inputs are passed via env vars instead of ${{ }} interpolation
+          # inside the script body, which prevents script injection via crafted inputs.
+          INPUT_TAG: ${{ github.event.inputs.hermes_tag }}
+          INPUT_BRANCH: ${{ github.event.inputs.hermes_branch }}
+          INPUT_DEBUG: ${{ github.event.inputs.debug }}
         run: |
-          # For manual triggers, use the provided tag/branch
-          if ("${{ github.event.inputs.hermes_tag }}") {
-            $version = "${{ github.event.inputs.hermes_tag }}"
-            $ref = "${{ github.event.inputs.hermes_tag }}"
-            $releaseUrl = "https://github.com/shineeagle/hermes-agent/releases/tag/$version"
+          # ---- Build type: debug is ONLY possible via the manual `debug`
+          #      toggle; scheduled runs are always release (goals.md) ----
+          $buildType = if ($env:INPUT_DEBUG -eq "true") { "debug" } else { "release" }
+          Write-Host "Build type: $buildType"
+
+          # ---- Case A: manual trigger with an explicit tag ----
+          if ($env:INPUT_TAG) {
+            $version = $env:INPUT_TAG
+            $ref = $env:INPUT_TAG
+            $releaseUrl = "https://github.com/NousResearch/hermes-agent/releases/tag/$version"
+            $refKind = "tag"
             Write-Host "Manual trigger: using tag $version"
-          } elseif ("${{ github.event.inputs.hermes_branch }}") {
-            $version = "${{ github.event.inputs.hermes_branch }}"
-            $ref = "${{ github.event.inputs.hermes_branch }}"
-            $releaseUrl = "https://github.com/shineeagle/hermes-agent/tree/$version"
+          }
+          # ---- Case B: manual trigger with a branch (defaults to 'main') ----
+          elseif ($env:INPUT_BRANCH) {
+            $version = $env:INPUT_BRANCH
+            $ref = $env:INPUT_BRANCH
+            $releaseUrl = "https://github.com/NousResearch/hermes-agent/tree/$version"
+            $refKind = "branch"
             Write-Host "Manual trigger: using branch $version"
-          } else {
-            # For scheduled runs, find the latest unbuilt release after 2026-08-01
-            Write-Host "Scheduled/manual (no input): finding latest unbuilt release after 2026-08-01..."
-            
-            # Get releases from hermes-agent
-            $allReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/shineeagle/hermes-agent/releases?per_page=30" -Headers @{Accept="application/vnd.github.v3+json"}
-            
-            # Filter: only stable releases after 2026-08-01 00:00:00 UTC
+          }
+          # ---- Case C: scheduled run -> find the newest upstream release
+          #              that has no RELEASE build yet ----
+          else {
+            Write-Host "Scheduled run: finding latest unbuilt release after 2026-08-01..."
+
+            # Fetch the 30 most recent upstream releases via the GitHub API.
+            # NOTE: We only use this list to decide WHICH version to package.
+            # The build is done from source (Steps 2-5), so upstream does NOT
+            # need to publish any Windows binaries — a Windows package is
+            # produced even when the upstream release has no Windows assets.
+            $allReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/NousResearch/hermes-agent/releases?per_page=30" -Headers @{Accept="application/vnd.github.v3+json"}
+
+            # Keep only stable (non-prerelease) versions published on/after
+            # 2026-08-01 UTC, newest first.
             $cutoffDate = [DateTime]::Parse("2026-08-01T00:00:00Z")
             $stableReleases = $allReleases | Where-Object { 
               -not $_.prerelease -and 
@@ -63,69 +160,173 @@ jobs:
               exit 0
             }
             
-            # Find the latest one that doesn't have a Windows build yet
+            # Find the latest release that has no RELEASE build yet.
+            # NOTE: release tags embed the BUILD timestamp (yyyyMMddHHmmss), which
+            # can differ from the upstream publish date, so we can't reconstruct
+            # the exact tag. Instead we fetch all existing releases of THIS repo
+            # once and check whether any tag ends with "-release-<upstreamTag>" —
+            # this works regardless of which day/time the build happened on.
+            # A manual debug build of the same version does NOT count as built:
+            # the automatic run still needs to publish the release package.
+            $existingTags = @(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName | ConvertFrom-Json | ForEach-Object tagName)
+
             $found = $false
             foreach ($release in $stableReleases) {
               $tag = $release.tag_name
-              $publishedAt = [DateTime]::Parse($release.published_at).ToString("yyyyMMdd")
-              $windowsTag = "hermes-agent-windows-$publishedAt-$tag"
-              
-              # Check if this Windows build already exists
-              $existing = gh release view $windowsTag 2>&1
-              if ($LASTEXITCODE -ne 0) {
-                # This release doesn't have a Windows build yet
+              $alreadyBuilt = $existingTags | Where-Object { $_ -like "*-release-$tag" }
+
+              if (-not $alreadyBuilt) {
+                # First (newest) release without a RELEASE build -> build it
                 $version = $tag
                 $ref = $tag
+                $refKind = "tag"
                 $releaseUrl = $release.html_url
                 Write-Host "Found unbuilt release: $version (published: $($release.published_at))"
                 $found = $true
                 break
               } else {
-                Write-Host "  ✓ $tag already built"
+                Write-Host "  ✓ $tag already built (as: $($alreadyBuilt -join ', '))"
               }
             }
-            
+
             if (-not $found) {
               Write-Host "✅ All releases after 2026-08-01 have been built"
               "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
               exit 0
             }
           }
-          
+
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "releaseUrl=$releaseUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "build_type=$buildType" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "ref_kind=$refKind" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      # ── Step 1b: Check if release already exists (skip for scheduled runs) ──
+      # ── Step 1b: Skip gate ─────────────────────────────────────
+      # Runs on EVERY trigger type and produces the single skip signal that all
+      # later steps consume (`steps.check.outputs.skip`):
+      #   1. If Step 1 decided there is nothing to build, propagate skip=true.
+      #   2. (Scheduled runs only) Double-check that a release for this version
+      #      does not already exist — guards against two schedule runs racing.
       - name: Check if release already exists
         id: check
-        if: github.event_name == 'schedule'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $version = "${{ steps.version.outputs.version }}"
-          $date = Get-Date -Format "yyyyMMdd"
-          $releaseTag = "hermes-agent-windows-$date-$version"
-          
-          # Check if this release already exists
-          $existing = gh release view $releaseTag 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "✅ Release $releaseTag already exists, skipping build"
+          # 1) Propagate the skip decision made in Step 1 (version outputs).
+          if ("${{ steps.version.outputs.skip }}" -eq "true") {
+            Write-Host "⏭️ Step 1 found nothing to build, skipping the pipeline"
             "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          $version = "${{ steps.version.outputs.version }}"
+          $buildType = "${{ steps.version.outputs.build_type }}"
+
+          # 2) For scheduled runs, guard against an already-existing release
+          #    (e.g. two schedule runs starting within the same minute).
+          #    The release tag embeds a second-level timestamp, so we cannot
+          #    reconstruct today's exact tag — instead we list all releases
+          #    and match the "<type>-<version>" suffix.
+          if ("${{ github.event_name }}" -eq "schedule") {
+            $existingTags = @(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName | ConvertFrom-Json | ForEach-Object tagName)
+            $alreadyReleased = $existingTags | Where-Object { $_ -like "hermes_agent-*-release-$version" }
+
+            if ($alreadyReleased) {
+              Write-Host "✅ Release for $version already exists ($($alreadyReleased -join ', ')), skipping build"
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            } else {
+              Write-Host "🆕 No release for $version yet, proceeding with build"
+              "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            }
           } else {
-            Write-Host "🆕 Release $releaseTag does not exist, proceeding with build"
+            # Manual runs: build unconditionally (operator explicitly asked for it).
+            Write-Host "Manual trigger for version '$version' ($buildType), proceeding with build"
             "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
       # ── Step 2: Checkout this repo (hermes-agent) ───────────────
+      # IMPORTANT: this packer repo IS a mirror of hermes-agent (plus the
+      # packaging files), so checking out the tag/branch determined in Step 1
+      # gives us the exact upstream source to install from.
       - name: Checkout hermes-agent repository
         if: steps.check.outputs.skip != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.version.outputs.ref }}
 
+      # ── Step 2b: Determine package naming ──────────────────────
+      # Computes the "<version|branch-hash>" part of the release/archive name
+      # (goals.md):
+      #   - tag builds    -> the tag itself (e.g. v0.20.0)
+      #   - branch builds -> "<branch>-<short-sha>" so the exact commit is
+      #                      identifiable from the name alone.
+      # The short SHA is read from the freshly checked-out working tree.
+      - name: Determine package naming
+        id: naming
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $buildType = "${{ steps.version.outputs.build_type }}"
+
+          if ("${{ steps.version.outputs.ref_kind }}" -eq "branch") {
+            $shortSha = (git rev-parse --short HEAD).Trim()
+            $nameVersion = "$version-$shortSha"
+          } else {
+            $nameVersion = "$version"
+          }
+
+          Write-Host "Package name version: $nameVersion (build type: $buildType)"
+          "name_version=$nameVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # ── Step 2c: Restore caches (rules.md: reuse previous work) ─
+      # Caches the slowest, most version-stable build inputs so a re-run of the
+      # same ref (or a fix-up build) does not re-download everything:
+      #   - hermes\uv-python  : uv-managed Python interpreters (keyed by ref;
+      #                         restore-keys lets any ref reuse the same 3.11)
+      #   - .uv-cache         : uv wheel/package cache
+      #   - .npm-cache        : npm package cache
+      # These live INSIDE the workspace so actions/cache can save/restore them
+      # without touching anything outside the job.
+      - name: Cache uv-managed Python
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: hermes/uv-python
+          key: hermes-uv-python-${{ steps.version.outputs.ref }}
+          restore-keys: |
+            hermes-uv-python-
+
+      - name: Cache uv package cache
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: .uv-cache
+          key: hermes-uv-cache-${{ steps.version.outputs.ref }}
+          restore-keys: |
+            hermes-uv-cache-
+
+      - name: Cache npm cache
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: .npm-cache
+          key: hermes-npm-cache-${{ steps.version.outputs.ref }}
+          restore-keys: |
+            hermes-npm-cache-
+
       # ── Step 3: Verify and patch install.ps1 ───────────────────
+      # Two jobs in one step:
+      #   a) Integrity check: compare the repo copy of install.ps1 against the
+      #      official one served by the Hermes team (SHA-256). A mismatch means
+      #      someone modified the repo copy — currently only a warning
+      #      (the failing `exit 1` is commented out).
+      #   b) Patching: the official script contains a line that resets PATH to
+      #      the user/machine values. That would wipe the PATH we carefully
+      #      built in Step 5 (ripgrep/ffmpeg locations), so we strip it and
+      #      save the result as install.new.ps1, which is what Step 5 runs.
       - name: Verify and patch install.ps1
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
@@ -163,6 +364,12 @@ jobs:
           }
 
       # ── Step 4: Prepare hermes directory and tools ─────────────
+      # Downloads the latest portable builds of ripgrep and ffmpeg from their
+      # GitHub releases and flattens them into:
+      #   hermes\tools\ripgrep\   (contains rg.exe)
+      #   hermes\tools\ffmpeg\    (contains ffmpeg.exe)
+      # hermes-launch.ps1 (shipped in the package) auto-adds every tools\*
+      # subdirectory to PATH at launch time.
       - name: Prepare hermes directory and download tools
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
@@ -202,13 +409,43 @@ jobs:
           Write-Host "✅ ffmpeg installed"
 
       # ── Step 5: Install Hermes Agent ────────────────────────────
+      # Runs install.new.ps1 (produced by Step 3) inside a minimal, controlled
+      # environment:
+      #   - PATH is reset to core Windows paths + the portable tools, so the
+      #     resulting installation is self-contained and reproducible
+      #   - HERMES_HOME points into the workspace, so EVERYTHING the installer
+      #     creates (venv, CLI, desktop app, user data) lands inside hermes\
+      #     and is fully captured by the archive
       - name: Install Hermes Agent
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
+        env:
+          # Force a hermetic Python: the windows-latest runner has Python 3.9-3.13
+          # preinstalled under C:\hostedtoolcache and registered in the registry
+          # (PEP 514 keys), which `uv python find` discovers EVEN WHEN PATH IS
+          # CLEAN (uv also queries the registry and the py.exe launcher).
+          # Reusing that interpreter would bake an absolute C:\hostedtoolcache\...
+          # path into venv\pyvenv.cfg and break the package on user machines.
+          #   - UV_PYTHON_PREFERENCE=only-managed : never use system Pythons
+          #   - UV_PYTHON_INSTALL_DIR             : download uv-managed Python
+          #     INSIDE hermes\ so it is captured by the 7z archive
+          UV_PYTHON_PREFERENCE: only-managed
+          UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}\hermes\uv-python
+          # Redirect package caches INSIDE the workspace so actions/cache
+          # (Step 2c) can save/restore them across runs (rules.md: reuse work).
+          UV_CACHE_DIR: ${{ github.workspace }}\.uv-cache
+          npm_config_cache: ${{ github.workspace }}\.npm-cache
+          # Playwright installs its browser engines to %LOCALAPPDATA%\ms-playwright
+          # by default, i.e. OUTSIDE hermes\ — they would never reach the archive
+          # and the package would not be self-contained. Redirect them into
+          # hermes\browsers so they ship inside the archive (goals.md: usable
+          # immediately after extraction). hermes-launch.ps1 sets the same value
+          # at runtime.
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}\hermes\browsers
         run: |
           $RootDir = "${{ github.workspace }}"
 
-          # Clean PATH — only essential Windows system paths
+          # Clean PATH — only essential Windows system paths + our tools
           $env:Path = @(
             "C:\WINDOWS\system32",
             "C:\WINDOWS",
@@ -222,14 +459,29 @@ jobs:
           $env:HERMES_HOME = "$RootDir\hermes"
           Write-Host "HERMES_HOME = $env:HERMES_HOME"
           Write-Host "PATH = $env:Path"
+          Write-Host "UV_PYTHON_PREFERENCE = $env:UV_PYTHON_PREFERENCE"
+          Write-Host "UV_PYTHON_INSTALL_DIR = $env:UV_PYTHON_INSTALL_DIR"
+          Write-Host "UV_CACHE_DIR = $env:UV_CACHE_DIR"
+          Write-Host "npm_config_cache = $env:npm_config_cache"
+          Write-Host "PLAYWRIGHT_BROWSERS_PATH = $env:PLAYWRIGHT_BROWSERS_PATH"
 
-          # install.new.ps1 is at the workspace root (this repo IS hermes-agent)
-          & powershell -ExecutionPolicy Bypass -File "$RootDir\install.new.ps1" -IncludeDesktop
+          # install.new.ps1 is at the workspace root (this repo IS hermes-agent).
+          # Official DEFAULT install (no -IncludeDesktop): the desktop GUI is an
+          # optional add-on in hermes-agent (see hermes_cli/gui_uninstall.py --
+          # the CLI/TUI agent does not need apps\desktop at all). The GUI
+          # archive is produced in Step 7 via the official installer stage
+          # "install.ps1 -Stage Desktop", so the TUI archive is a plain official
+          # install and never pays for an Electron build.
+          & powershell -ExecutionPolicy Bypass -File "$RootDir\install.new.ps1"
           if ($LASTEXITCODE -ne 0) {
             throw "install.new.ps1 failed with exit code $LASTEXITCODE"
           }
 
       # ── Step 6: Copy extra files into hermes package ───────────
+      # Adds files that live in THIS packer repo (not upstream) to the package:
+      #   - hermes-launch.ps1: sets HERMES_HOME and adds tools\* to PATH,
+      #     then opens a ready-to-use PowerShell window.
+      # Add more files here if needed (see commented example below).
       - name: Prepare package contents
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
@@ -248,7 +500,32 @@ jobs:
           Write-Host "Package directory contents:"
           Get-ChildItem $HermesDir -Depth 1 | Format-Table Name, Length, LastWriteTime
 
-      # ── Step 7: Package with 7z ────────────────────────────────
+      # ── Step 7: Package with 7z (tui + gui, two archives) ─────
+      # Produces TWO archives per run, named per goals.md plus a variant token:
+      #     hermes_agent-<yyyyMMddHHmmss>-<release|debug>-<tui|gui>-<version|branch-hash>.7z
+      #
+      # Official GUI semantics (hermes_cli/gui_uninstall.py + install.ps1
+      # Stage-Desktop): the desktop GUI is an OPTIONAL add-on. The CLI/TUI
+      # agent needs nothing under apps\desktop; the desktop app is built on
+      # demand via the official installer stage "install.ps1 -Stage Desktop"
+      # (Install-Desktop -> root npm install incl. Electron -> electron-builder
+      # pack -> apps\desktop\release\win-unpacked\Hermes.exe). The stage does
+      # not launch the GUI, so it is CI-safe.
+      #
+      #   tui   - plain official install; the whole apps\ tree (desktop GUI)
+      #           and .git are excluded with the 7z -xr! filter (tool-based,
+      #           rules.md #4 -- files stay on disk for the GUI build below).
+      #   gui   - tui install + desktop app built with the official stage.
+      #
+      #   debug   - packaged directly after install, nothing is pruned
+      #             (goals.md); tui/gui differ only by the desktop app.
+      #   release - everything not needed at runtime is removed BEFORE packing
+      #             (goals.md). Common pruning runs twice: before tui (keeps the
+      #             tui archive small) and again before gui (the desktop build
+      #             re-runs `npm install`, so the gui archive needs a second
+      #             prune). Desktop source/intermediate dirs are removed only
+      #             AFTER the GUI build. The tree is pruned IN PLACE (it is
+      #             disposable after this step, so we avoid copying ~4 GB).
       - name: Package with 7z
         if: steps.check.outputs.skip != 'true'
         id: package
@@ -256,61 +533,248 @@ jobs:
         run: |
           $RootDir = "${{ github.workspace }}"
           $HermesDir = "$RootDir\hermes"
-          $version = "${{ steps.version.outputs.version }}"
+          $AgentDir = "$HermesDir\hermes-agent"
+          $buildType = "${{ steps.version.outputs.build_type }}"
+          $nameVersion = "${{ steps.naming.outputs.name_version }}"
+          $SevenZip = "C:\Program Files\7-Zip\7z.exe"
+          $installer = "$RootDir\install.new.ps1"
 
-          $date = Get-Date -Format "yyyyMMdd"
-          # Archive name: hermes-agent-windows-yyyyMMdd-{tag-or-sha}.7z
-          $archiveName = "hermes-agent-windows-$date-$version.7z"
+          # HH (24-hour) gives a unique, sortable timestamp; hh (12-hour)
+          # would collide between morning/afternoon builds.
+          $date = Get-Date -Format "yyyyMMddHHmmss"
 
-          # 7z is pre-installed on windows-latest runners
-          & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=9 `
-            "$RootDir\$archiveName" "$HermesDir\*"
+          # Archive names follow goals.md + a tui|gui variant token:
+          #   hermes_agent-<ts>-<release|debug>-<tui|gui>-<version|branch-hash>.7z
+          $archiveTui = "hermes_agent-$date-$buildType-tui-$nameVersion.7z"
+          $archiveGui = "hermes_agent-$date-$buildType-gui-$nameVersion.7z"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "7z compression failed"
+          function New-Package([string]$archive, [string[]]$excludes) {
+            Write-Host "📦 $archive"
+            $zargs = @("a", "-t7z", "-mx=3", "-bsp1")
+            foreach ($x in $excludes) { $zargs += "-xr!$x" }
+            $zargs += "$RootDir\$archive"
+            $zargs += "$HermesDir\*"
+            # 7z is pre-installed on windows-latest runners.
+            # -mx=3: fast compression (good speed/ratio balance; -mx=9 is very
+            #        slow with minimal gain) -bsp1: show progress percentage
+            # -xr!: exclude a subtree from the archive (tool-based filtering,
+            #       rules.md #4 -- does NOT delete the files on disk).
+            # Out-Host keeps 7z output visible without leaking it into the
+            # function's return value.
+            & $SevenZip @zargs | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "7z failed for $archive" }
+            $size = [math]::Round((Get-Item "$RootDir\$archive").Length / 1MB, 1)
+            Write-Host "✅ $archive ($size MB)"
           }
 
-          # Store archive name for subsequent steps.
-          "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          $size = (Get-Item "$RootDir\$archiveName").Length / 1MB
-          Write-Host "✅ Created $archiveName ($([math]::Round($size, 1)) MB)"
+          # Common release pruning: content the CLI/TUI agent never needs at
+          # runtime. Idempotent, safe to run before tui AND again before gui.
+          function Invoke-CommonPrune {
+            # --- npm prune --omit=dev removes dev dependencies of ALL workspaces
+            # (root package.json is an npm workspaces manifest: apps/*, ui-tui,
+            # web, tests-js). Runtime deps (agent-browser, ui-tui deps) survive.
+            # Built-in tool, preferred over hand-filtering node_modules.
+            $env:Path = "$HermesDir\node;$env:Path"
+            $npmExe = "$HermesDir\node\npm.cmd"
+            if (Test-Path $npmExe) {
+              Push-Location $AgentDir
+              try {
+                & $npmExe prune --omit=dev 2>&1 | ForEach-Object { "$_" }
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Warning "npm prune failed (exit $LASTEXITCODE) -- keeping dev dependencies"
+                } else {
+                  Write-Host "✅ dev dependencies pruned"
+                }
+              } finally { Pop-Location }
+            } else {
+              Write-Warning "npm.cmd not found at $npmExe -- skipping dev-dependency prune"
+            }
 
-      # ── Step 8: Upload artifact ─────────────────────────────────
-      - name: Upload build artifact
+            # --- Development-only directories (never needed at runtime) ---
+            $junkDirs = @(
+              "website", "tests", "tests-js", "docs", ".github", "nix", "docker",
+              "mcp-research-data", "datagen-config-examples", "contributors",
+              "hermes_agent.egg-info", ".plans"
+            )
+            foreach ($d in $junkDirs) {
+              Remove-Item "$AgentDir\$d" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            # __pycache__ anywhere under the package (Python bytecode cache)
+            Get-ChildItem $HermesDir -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            # HERMES_HOME caches/logs produced during the CI install.
+            foreach ($d in @("audio_cache", "image_cache", "logs")) {
+              Remove-Item "$HermesDir\$d" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # ── 1/2 TUI archive: plain official install, no desktop GUI ──
+          if ($buildType -eq "release") {
+            Write-Host "Pruning release package (removing non-runtime content)..."
+            Invoke-CommonPrune
+            Write-Host "✅ Release pruning complete (tui)"
+          } else {
+            Write-Host "🔧 Debug package: kept as installed, nothing pruned"
+          }
+          # The tui archive EXCLUDES the whole apps\ tree (the desktop GUI) and
+          # the .git clone history via 7z -- the files stay on disk so the GUI
+          # build below can still use apps\desktop.
+          New-Package $archiveTui @("hermes-agent\apps", "hermes-agent\.git")
+
+          # ── Build the desktop GUI with the OFFICIAL installer stage ──
+          # "install.ps1 -Stage Desktop" = Install-DesktopVoiceDeps +
+          # Install-Desktop (root npm install incl. Electron, then
+          # electron-builder pack). Only the gui archive pays for this build;
+          # the tui archive is already packed.
+          $env:HERMES_HOME = "$RootDir\hermes"
+          Write-Host "Building desktop GUI via install.new.ps1 -Stage Desktop ..."
+          & powershell -ExecutionPolicy Bypass -File $installer -Stage Desktop
+          if ($LASTEXITCODE -ne 0) {
+            throw "install.new.ps1 -Stage Desktop failed with exit code $LASTEXITCODE"
+          }
+
+          # ── 2/2 GUI archive: desktop app included ──
+          if ($buildType -eq "release") {
+            # Second prune: the desktop build re-ran `npm install`, so dev
+            # dependencies (incl. Electron) are back; prune them again and drop
+            # desktop build-time source/intermediate dirs (keep win-unpacked).
+            Invoke-CommonPrune
+
+            # node_modules\hermes is an npm workspace LINK (junction or symlink)
+            # to apps\desktop; Remove-Item -Recurse FOLLOWS reparse points and
+            # would delete the REAL apps\desktop contents, so the link itself is
+            # removed with cmd rmdir (which never recurses).
+            $nmHermes = Get-Item "$AgentDir\node_modules\hermes" -Force -ErrorAction SilentlyContinue
+            if ($nmHermes) {
+              if ($nmHermes.LinkType) {
+                & cmd /c "rmdir `"$($nmHermes.FullName)`""
+              } else {
+                Remove-Item $nmHermes.FullName -Recurse -Force -ErrorAction SilentlyContinue
+              }
+            }
+            foreach ($d in @(
+              "$AgentDir\node_modules\electron",       # build-time only (~150 MB; devDependency,
+                                                       # npm prune above should have removed it already --
+                                                       # belt and suspenders in case prune failed)
+              "$AgentDir\apps\desktop\src",            # GUI runs from release\win-unpacked\Hermes.exe;
+              "$AgentDir\apps\desktop\public",         # none of these source/intermediate dirs are
+              "$AgentDir\apps\desktop\electron",       # needed at runtime
+              "$AgentDir\apps\desktop\dist",
+              "$AgentDir\apps\desktop\e2e",
+              "$AgentDir\apps\desktop\pr-assets",
+              "$AgentDir\apps\desktop\scripts",
+              "$AgentDir\apps\desktop\node_modules"
+            )) {
+              Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "✅ Release pruning complete (gui)"
+          }
+          # The gui archive keeps apps\desktop\release\win-unpacked\Hermes.exe
+          # and always drops .git (build-machine clone history, not needed at
+          # runtime). In release mode the desktop source/intermediate dirs are
+          # also excluded (belt-and-suspenders on top of the physical removal).
+          $guiExcludes = @("hermes-agent\.git")
+          if ($buildType -eq "release") {
+            $guiExcludes += @(
+              "hermes-agent\node_modules\electron",
+              "hermes-agent\node_modules\hermes",
+              "hermes-agent\apps\desktop\src",
+              "hermes-agent\apps\desktop\public",
+              "hermes-agent\apps\desktop\electron",
+              "hermes-agent\apps\desktop\dist",
+              "hermes-agent\apps\desktop\e2e",
+              "hermes-agent\apps\desktop\pr-assets",
+              "hermes-agent\apps\desktop\scripts",
+              "hermes-agent\apps\desktop\node_modules"
+            )
+          }
+          New-Package $archiveGui $guiExcludes
+
+          Write-Host "🎁 Packages:"
+          Write-Host "   $archiveTui"
+          Write-Host "   $archiveGui"
+          "archive_tui=$archiveTui" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "archive_gui=$archiveGui" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # ── Step 8: Upload artifacts ────────────────────────────────
+      # Keeps both archives (gui + tui) as a build artifact for 7 days so they
+      # can be inspected/downloaded from the Actions UI even if the release fails.
+      - name: Upload build artifacts
         if: steps.check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: hermes-agent-windows-x64
-          path: ${{ github.workspace }}\${{ steps.package.outputs.archive_name }}
+          name: hermes_agent-${{ steps.version.outputs.build_type }}-${{ steps.version.outputs.version }}
+          path: ${{ github.workspace }}/hermes_agent-*.7z
           retention-days: 7
 
       # ── Step 9: Create Release ──────────────────────────────────
+      # Publishes BOTH archives (gui + tui) in THIS repository:
+      #   - Tag:    hermes_agent-<yyyyMMddHHmmss>-<release|debug>-<version|branch-hash>
+      #   - Assets: hermes_agent-<ts>-<release|debug>-gui-<version|branch-hash>.7z
+      #             hermes_agent-<ts>-<release|debug>-tui-<version|branch-hash>.7z
+      #   - Title:  "Hermes Agent <build_type> <date> (<version|branch-hash>)"
+      # Idempotent: the tag embeds a second-level timestamp, so a re-run cannot
+      # reconstruct today's exact tag. Instead we list releases and match the
+      # "<type>-<version>" suffix; if one already exists we upload the archives
+      # into it with --clobber rather than creating another tag.
       - name: Create GitHub Release
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $date = Get-Date -Format "yyyyMMdd"
+          $date = Get-Date -Format "yyyyMMddHHmmss"
           $version = "${{ steps.version.outputs.version }}"
-          $archive = "${{ steps.package.outputs.archive_name }}"
+          $buildType = "${{ steps.version.outputs.build_type }}"
+          $nameVersion = "${{ steps.naming.outputs.name_version }}"
           $releaseUrl = "${{ steps.version.outputs.releaseUrl }}"
-          
-          # Release tag format: hermes-agent-windows-yyyyMMdd-{version}
-          $releaseTag = "hermes-agent-windows-$date-$version"
-          $releaseTitle = "Hermes Agent Windows $date ($version)"
+          $archiveGui = "${{ steps.package.outputs.archive_gui }}"
+          $archiveTui = "${{ steps.package.outputs.archive_tui }}"
+          $archives = @($archiveGui, $archiveTui)
 
-          # Check if this exact release already exists
-          $existing = gh release view $releaseTag 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release $releaseTag already exists, uploading to it"
-            gh release upload $releaseTag "$archive" --clobber
+          # Release tag follows goals.md:
+          #   hermes_agent-<yyyyMMddHHmmss>-<release|debug>-<version|branch-hash>
+          $releaseTag = "hermes_agent-$date-$buildType-$nameVersion"
+          $releaseTitle = "Hermes Agent $buildType $date ($nameVersion)"
+
+          if ($buildType -eq "release") {
+            $variantNote = "Runtime-only: dev/test/docs source, dev dependencies and caches removed."
+          } else {
+            $variantNote = "Debug build: complete installer output, nothing removed (for testing)."
+          }
+
+          $notes = @(
+            "Automated, ready-to-run Windows build for hermes-agent $nameVersion ($buildType)"
+            ""
+            $variantNote
+            ""
+            "**Two package variants:**"
+            "| Variant | Contents |"
+            "|---------|----------|"
+            "| **gui** | CLI/TUI + desktop GUI |"
+            "| **tui** | CLI/TUI only (smaller) |"
+            ""
+            "Built entirely from source (no upstream Windows binaries required)."
+            ""
+            "**Source Release:** $releaseUrl"
+            ""
+            "Built with the official installer; desktop GUI via install.ps1 -Stage Desktop"
+          ) -join "`n"
+
+          # Idempotency check (see comment above): match the <type>-<version> suffix.
+          $existingTags = @(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName | ConvertFrom-Json | ForEach-Object tagName)
+          $existing = $existingTags | Where-Object { $_ -like "hermes_agent-*-$buildType-$nameVersion" } | Select-Object -First 1
+
+          if ($existing) {
+            Write-Host "Release for '$nameVersion' ($buildType) already exists as '$existing', uploading into it"
+            gh release upload $existing @archives --clobber
           } else {
             Write-Host "Creating new release: $releaseTag"
-            gh release create $releaseTag "$archive" `
+            gh release create $releaseTag @archives `
               --title $releaseTitle `
-              --notes "Automated Windows build for hermes-agent $version`n`n**Source Release:** $releaseUrl`n`nBuilt with install.new.ps1 -IncludeDesktop`n`nArchive: $archive"
+              --notes $notes
           }
 
           Write-Host "✅ Release published: $releaseTag"
+          Write-Host "   $archiveGui"
+          Write-Host "   $archiveTui"
