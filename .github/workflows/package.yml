@@ -17,8 +17,8 @@
 #    Step 6    Add extra package files (hermes-launch.ps1)
 #    Step 7    Package TWO archives with 7z: tui = plain official install
 #              (no desktop GUI); gui = desktop built on demand via the
-#              official "install.ps1 -Stage Desktop" stage. debug = as
-#              installed; release = pruned
+#              official "install.ps1 -IncludeDesktop -Stage Desktop" stage.
+#              debug = as installed; release = pruned
 #    Step 8    Upload both archives as a build artifact (kept 7 days)
 #    Step 9    Create (or update) the GitHub Release with both archives
 #
@@ -470,8 +470,8 @@ jobs:
           # optional add-on in hermes-agent (see hermes_cli/gui_uninstall.py --
           # the CLI/TUI agent does not need apps\desktop at all). The GUI
           # archive is produced in Step 7 via the official installer stage
-          # "install.ps1 -Stage Desktop", so the TUI archive is a plain official
-          # install and never pays for an Electron build.
+          # "install.ps1 -IncludeDesktop -Stage Desktop", so the TUI archive is
+          # a plain official install and never pays for an Electron build.
           & powershell -ExecutionPolicy Bypass -File "$RootDir\install.new.ps1"
           if ($LASTEXITCODE -ne 0) {
             throw "install.new.ps1 failed with exit code $LASTEXITCODE"
@@ -507,10 +507,10 @@ jobs:
       # Official GUI semantics (hermes_cli/gui_uninstall.py + install.ps1
       # Stage-Desktop): the desktop GUI is an OPTIONAL add-on. The CLI/TUI
       # agent needs nothing under apps\desktop; the desktop app is built on
-      # demand via the official installer stage "install.ps1 -Stage Desktop"
-      # (Install-Desktop -> root npm install incl. Electron -> electron-builder
-      # pack -> apps\desktop\release\win-unpacked\Hermes.exe). The stage does
-      # not launch the GUI, so it is CI-safe.
+      # demand via the official installer stage "install.ps1 -IncludeDesktop
+      # -Stage Desktop" (Install-Desktop -> root npm install incl. Electron ->
+      # electron-builder pack -> apps\desktop\release\win-unpacked\Hermes.exe).
+      # The stage does not launch the GUI, so it is CI-safe.
       #
       #   tui   - plain official install; the whole apps\ tree (desktop GUI)
       #           and .git are excluded with the 7z -xr! filter (tool-based,
@@ -657,15 +657,19 @@ jobs:
           New-Package $archiveTui @("hermes-agent\apps", "hermes-agent\.git")
 
           # ── Build the desktop GUI with the OFFICIAL installer stage ──
-          # "install.ps1 -Stage Desktop" = Install-DesktopVoiceDeps +
+          # "install.ps1 -IncludeDesktop -Stage Desktop" = Install-DesktopVoiceDeps +
           # Install-Desktop (root npm install incl. Electron, then
-          # electron-builder pack). Only the gui archive pays for this build;
-          # the tui archive is already packed.
+          # electron-builder pack). NOTE: the `desktop` stage is registered in
+          # the stage list ONLY when -IncludeDesktop is passed (official
+          # install.ps1 gates `$InstallStages += desktop` behind it), so both
+          # flags are required together; -Stage alone fails with
+          # "unknown stage". Only the gui archive pays for this build; the tui
+          # archive is already packed.
           $env:HERMES_HOME = "$RootDir\hermes"
-          Write-Host "Building desktop GUI via install.new.ps1 -Stage Desktop ..."
-          & powershell -ExecutionPolicy Bypass -File $installer -Stage Desktop
+          Write-Host "Building desktop GUI via install.new.ps1 -IncludeDesktop -Stage Desktop ..."
+          & powershell -ExecutionPolicy Bypass -File $installer -IncludeDesktop -Stage Desktop
           if ($LASTEXITCODE -ne 0) {
-            throw "install.new.ps1 -Stage Desktop failed with exit code $LASTEXITCODE"
+            throw "install.new.ps1 -IncludeDesktop -Stage Desktop failed with exit code $LASTEXITCODE"
           }
 
           # ── 2/2 GUI archive: desktop app included ──
@@ -793,7 +797,7 @@ jobs:
             ""
             "**Source Release:** $releaseUrl"
             ""
-            "Built with the official installer; desktop GUI via install.ps1 -Stage Desktop"
+            "Built with the official installer; desktop GUI via install.ps1 -IncludeDesktop -Stage Desktop"
           ) -join "`n"
 
           # Idempotency check (see comment above): match the <type>-<version> suffix.
