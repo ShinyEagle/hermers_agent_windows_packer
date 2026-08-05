@@ -259,10 +259,13 @@ jobs:
       # ── Step 2b: Determine package naming ──────────────────────
       # Computes the "<version|branch-hash>" part of the release/archive name
       # (goals.md):
-      #   - tag builds    -> the tag itself (e.g. v0.20.0)
-      #   - branch builds -> "<branch>-<short-sha>" so the exact commit is
-      #                      identifiable from the name alone.
-      # The short SHA is read from the freshly checked-out working tree.
+      #   - tag builds    -> the upstream tag itself (e.g. v0.20.0)
+      #   - branch builds -> "<branch>-<short-sha>" where <branch> is the
+      #                      hermes-agent branch and <short-sha> is the UPSTREAM
+      #                      hermes-agent branch HEAD commit. NOTE: this packer
+      #                      repo is NOT hermes-agent, so a local
+      #                      `git rev-parse` would return the packer's own SHA;
+      #                      the upstream HEAD is queried via git ls-remote.
       - name: Determine package naming
         id: naming
         if: steps.check.outputs.skip != 'true'
@@ -270,10 +273,21 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.version }}"
           $buildType = "${{ steps.version.outputs.build_type }}"
+          $upstream = "https://github.com/NousResearch/hermes-agent.git"
 
           if ("${{ steps.version.outputs.ref_kind }}" -eq "branch") {
-            $shortSha = (git rev-parse --short HEAD).Trim()
-            $nameVersion = "$version-$shortSha"
+            # <branch-hash> must describe HERMES, not this packer repo.
+            # git ls-remote prints "<full-sha>`trefs/heads/<branch>".
+            $branch = $version
+            $remote = git ls-remote $upstream "refs/heads/$branch"
+            if ($LASTEXITCODE -eq 0 -and $remote) {
+              $fullSha = (($remote -split "`r?`n")[0] -split "[\s`t]+")[0]
+              $shortSha = $fullSha.Substring(0, [Math]::Min(7, $fullSha.Length))
+              $nameVersion = "$branch-$shortSha"
+            } else {
+              Write-Warning "Could not resolve upstream branch '$branch'; falling back to branch name only"
+              $nameVersion = $branch
+            }
           } else {
             $nameVersion = "$version"
           }
