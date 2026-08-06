@@ -59,7 +59,7 @@ name: Build and Release Hermes Agent
 on:
   # Poll for new upstream hermes-agent releases every hour (at minute 0).
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 0/2 * * *'
   
   # Manual trigger: build a specific branch or tag on demand.
   workflow_dispatch:
