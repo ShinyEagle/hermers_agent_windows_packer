@@ -72,6 +72,11 @@ on:
         description: 'hermes-agent tag to build (takes precedence over hermes_branch)'
         required: false
         default: ''
+      hermes_agent_repository:
+        description: 'GitHub repository to use for the build (default: upstream hermes-agent)'
+        required: false
+        default: 'NousResearch/hermes-agent'
+
       # Debug build toggle (goals.md): debug packages are only ever produced by
       # manually toggling this input. They are packaged directly after install
       # with NOTHING removed (for testing). The automatic hourly run always
@@ -100,6 +105,9 @@ jobs:
       #   skip       -> 'true' when there is nothing to build
       #   build_type -> 'release' | 'debug' (goals.md: debug = manual toggle only)
       #   ref_kind   -> 'tag' | 'branch' (chooses <version> vs <branch-hash> naming)
+      #   repo       -> the configured hermes_agent_repository (the "reference"
+      #                 repo that decides WHICH version to build / where the
+      #                 source SHA comes from)
       - name: Determine version to build
         id: version
         shell: pwsh
@@ -110,7 +118,35 @@ jobs:
           INPUT_TAG: ${{ github.event.inputs.hermes_tag }}
           INPUT_BRANCH: ${{ github.event.inputs.hermes_branch }}
           INPUT_DEBUG: ${{ github.event.inputs.debug }}
+          INPUT_REPO: ${{ github.event.inputs.hermes_agent_repository }}
         run: |
+          # ---- Resolve + validate the target repository (fail fast) ----
+          # The `hermes_agent_repository` input decides WHERE we look for
+          # releases/branches — the "reference" repository. It is validated in
+          # this FIRST step so a typo or a removed/private repo fails the run
+          # immediately, before any checkout/download/install work is wasted.
+          $repo = if ($env:INPUT_REPO) { $env:INPUT_REPO.Trim() } else { "NousResearch/hermes-agent" }
+          Write-Host "Target repository: $repo"
+
+          # Authenticated headers: avoid the unauthenticated GitHub API rate
+          # limit (60 req/h) — this step can make several API calls.
+          $apiHeaders = @{
+            Accept        = "application/vnd.github.v3+json"
+            Authorization = "Bearer $env:GH_TOKEN"
+          }
+
+          # A 404 comes back as a JSON body WITHOUT `full_name`, so a missing
+          # full_name means the repo does not exist / is not visible to this
+          # token. -SkipHttpErrorCheck needs PowerShell 7 (pwsh on the runner).
+          $repoCheck = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo" -Headers $apiHeaders -SkipHttpErrorCheck
+          if ($repoCheck.full_name -ne $repo) {
+            $errMsg = if ($repoCheck.message) { $repoCheck.message } else { "not found" }
+            Write-Error "❌ Repository '$repo' does not exist or is not accessible (GitHub API: '$errMsg')."
+            Write-Error "   Please verify the 'hermes_agent_repository' input and re-run the workflow."
+            exit 1
+          }
+          Write-Host "✅ Repository '$repo' verified"
+
           # ---- Build type: debug is ONLY possible via the manual `debug`
           #      toggle; scheduled runs are always release (goals.md) ----
           $buildType = if ($env:INPUT_DEBUG -eq "true") { "debug" } else { "release" }
@@ -120,7 +156,7 @@ jobs:
           if ($env:INPUT_TAG) {
             $version = $env:INPUT_TAG
             $ref = $env:INPUT_TAG
-            $releaseUrl = "https://github.com/NousResearch/hermes-agent/releases/tag/$version"
+            $releaseUrl = "https://github.com/$repo/releases/tag/$version"
             $refKind = "tag"
             Write-Host "Manual trigger: using tag $version"
           }
@@ -128,7 +164,7 @@ jobs:
           elseif ($env:INPUT_BRANCH) {
             $version = $env:INPUT_BRANCH
             $ref = $env:INPUT_BRANCH
-            $releaseUrl = "https://github.com/NousResearch/hermes-agent/tree/$version"
+            $releaseUrl = "https://github.com/$repo/tree/$version"
             $refKind = "branch"
             Write-Host "Manual trigger: using branch $version"
           }
@@ -142,7 +178,7 @@ jobs:
             # The build is done from source (Steps 2-5), so upstream does NOT
             # need to publish any Windows binaries — a Windows package is
             # produced even when the upstream release has no Windows assets.
-            $allReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/NousResearch/hermes-agent/releases?per_page=30" -Headers @{Accept="application/vnd.github.v3+json"}
+            $allReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=30" -Headers $apiHeaders
 
             # Keep only stable (non-prerelease) versions published on/after
             # 2026-08-01 UTC, newest first.
@@ -201,6 +237,7 @@ jobs:
           "releaseUrl=$releaseUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "build_type=$buildType" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "ref_kind=$refKind" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "repo=$repo" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # ── Step 1b: Skip gate ─────────────────────────────────────
       # Runs on EVERY trigger type and produces the single skip signal that all
@@ -249,12 +286,13 @@ jobs:
       # ── Step 2: Checkout this repo (hermes-agent) ───────────────
       # IMPORTANT: this packer repo IS a mirror of hermes-agent (plus the
       # packaging files), so checking out the tag/branch determined in Step 1
-      # gives us the exact upstream source to install from.
+      # gives us the exact upstream source to install from. The REF comes from
+      # the repository configured in Step 1 (hermes_agent_repository); for the
+      # packer to check it out here, this repo must contain that tag/branch.
       - name: Checkout hermes-agent repository
         if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v7
-        with:
-          ref: ${{ steps.version.outputs.ref }}
+
 
       # ── Step 2b: Determine package naming ──────────────────────
       # Computes the "<version|branch-hash>" part of the release/archive name
@@ -265,7 +303,8 @@ jobs:
       #                      hermes-agent branch HEAD commit. NOTE: this packer
       #                      repo is NOT hermes-agent, so a local
       #                      `git rev-parse` would return the packer's own SHA;
-      #                      the upstream HEAD is queried via git ls-remote.
+      #                      the upstream HEAD is queried via git ls-remote
+      #                      against the repository configured in Step 1.
       - name: Determine package naming
         id: naming
         if: steps.check.outputs.skip != 'true'
@@ -273,7 +312,7 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.version }}"
           $buildType = "${{ steps.version.outputs.build_type }}"
-          $upstream = "https://github.com/NousResearch/hermes-agent.git"
+          $upstream = "https://github.com/${{ steps.version.outputs.repo }}.git"
 
           if ("${{ steps.version.outputs.ref_kind }}" -eq "branch") {
             # <branch-hash> must describe HERMES, not this packer repo.
@@ -808,6 +847,8 @@ jobs:
             "| **tui** | CLI/TUI only (smaller) |"
             ""
             "Built entirely from source (no upstream Windows binaries required)."
+            ""
+            "**Source Repository:** https://github.com/${{ steps.version.outputs.repo }}"
             ""
             "**Source Release:** $releaseUrl"
             ""
