@@ -15,10 +15,13 @@
 #    Step 4    Download portable tools (ripgrep, ffmpeg) into hermes\tools
 #    Step 5    Run the patched installer into a clean HERMES_HOME
 #    Step 6    Add extra package files (hermes-launch.ps1)
-#    Step 7    Package TWO archives with 7z: tui = plain official install
-#              (no desktop GUI); gui = desktop built on demand via the
-#              official "install.ps1 -IncludeDesktop -Stage Desktop" stage.
-#              debug = as installed; release = pruned
+#    Step 7    Package TWO archives with 7z in three sub-steps:
+#    Step 7a   Package TUI package with 7z (plain official install, no desktop
+#              GUI; debug = as installed, release = pruned)
+#    Step 7b   Install desktop support: build the desktop GUI on demand via the
+#              official "install.ps1 -IncludeDesktop -Stage Desktop" stage
+#    Step 7c   Package GUI package with 7z (tui contents + desktop app;
+#              debug = as installed, release = pruned)
 #    Step 8    Upload both archives as a build artifact (kept 7 days)
 #    Step 9    Create (or update) the GitHub Release with both archives
 #
@@ -575,35 +578,33 @@ jobs:
           Write-Host "Package directory contents:"
           Get-ChildItem $HermesDir -Depth 1 | Format-Table Name, Length, LastWriteTime
 
-      # ── Step 7: Package with 7z (tui + gui, two archives) ─────
-      # Produces TWO archives per run, named per goals.md plus a variant token:
-      #     hermes_agent-<yyyyMMddHHmmss>-<release|debug>-<tui|gui>-<version|branch-hash>.7z
+      # ── Step 7a: Package TUI package with 7z ──────────────────
+      # Produces the FIRST of two archives, the CLI/TUI-only variant (goals.md):
+      #     hermes_agent-<yyyyMMddHHmmss>-<release|debug>-tui-<version|branch-hash>.7z
       #
       # Official GUI semantics (hermes_cli/gui_uninstall.py + install.ps1
       # Stage-Desktop): the desktop GUI is an OPTIONAL add-on. The CLI/TUI
-      # agent needs nothing under apps\desktop; the desktop app is built on
-      # demand via the official installer stage "install.ps1 -IncludeDesktop
-      # -Stage Desktop" (Install-Desktop -> root npm install incl. Electron ->
-      # electron-builder pack -> apps\desktop\release\win-unpacked\Hermes.exe).
-      # The stage does not launch the GUI, so it is CI-safe.
+      # agent needs nothing under apps\desktop, so the TUI archive is a plain
+      # official install and never pays for an Electron build.
       #
       #   tui   - plain official install; the whole apps\ tree (desktop GUI)
       #           and .git are excluded with the 7z -xr! filter (tool-based,
-      #           rules.md #4 -- files stay on disk for the GUI build below).
-      #   gui   - tui install + desktop app built with the official stage.
+      #           rules.md #4 -- files stay on disk so the desktop build in
+      #           Step 7b can still use apps\desktop).
       #
       #   debug   - packaged directly after install, nothing is pruned
-      #             (goals.md); tui/gui differ only by the desktop app.
-      #   release - everything not needed at runtime is removed BEFORE packing
-      #             (goals.md). Common pruning runs twice: before tui (keeps the
-      #             tui archive small) and again before gui (the desktop build
-      #             re-runs `npm install`, so the gui archive needs a second
-      #             prune). Desktop source/intermediate dirs are removed only
-      #             AFTER the GUI build. The tree is pruned IN PLACE (it is
-      #             disposable after this step, so we avoid copying ~4 GB).
-      - name: Package with 7z
+      #             (goals.md).
+      #   release - everything not needed at runtime is pruned BEFORE packing
+      #             (goals.md). The tree is pruned IN PLACE (it is disposable
+      #             after this step, so we avoid copying ~4 GB).
+      #
+      # Also writes package-helpers.ps1 (shared 7z/prune helpers) to disk for
+      # Step 7c, and exports the run timestamp so the GUI archive (Step 7c)
+      # uses the SAME <yyyyMMddHHmmss> in its name -- both archives of a run
+      # must share one timestamp.
+      - name: Package TUI package with 7z
         if: steps.check.outputs.skip != 'true'
-        id: package
+        id: package_tui
         shell: pwsh
         run: |
           $RootDir = "${{ github.workspace }}"
@@ -611,19 +612,26 @@ jobs:
           $AgentDir = "$HermesDir\hermes-agent"
           $buildType = "${{ steps.version.outputs.build_type }}"
           $nameVersion = "${{ steps.naming.outputs.name_version }}"
-          $SevenZip = "C:\Program Files\7-Zip\7z.exe"
-          $installer = "$RootDir\install.new.ps1"
 
           # HH (24-hour) gives a unique, sortable timestamp; hh (12-hour)
-          # would collide between morning/afternoon builds.
+          # would collide between morning/afternoon builds. Captured ONCE here
+          # and reused by the GUI archive in Step 7c so both archives of this
+          # run carry the same run id.
           $date = Get-Date -Format "yyyyMMddHHmmss"
-
-          # Archive names follow goals.md + a tui|gui variant token:
-          #   hermes_agent-<ts>-<release|debug>-<tui|gui>-<version|branch-hash>.7z
           $archiveTui = "hermes_agent-$date-$buildType-tui-$nameVersion.7z"
-          $archiveGui = "hermes_agent-$date-$buildType-gui-$nameVersion.7z"
 
-          function New-Package([string]$archive, [string[]]$excludes) {
+          # ── Shared helpers (used here AND in Step 7c) ──
+          # Persisted to disk because every workflow step is a fresh pwsh
+          # process; Step 7c dot-sources the same file.
+          $helper = @'
+          function New-Package {
+            param(
+              [string]$RootDir,
+              [string]$HermesDir,
+              [string]$archive,
+              [string[]]$excludes
+            )
+            $SevenZip = "C:\Program Files\7-Zip\7z.exe"
             Write-Host "📦 $archive"
             $zargs = @("a", "-t7z", "-mx=3", "-bsp1")
             foreach ($x in $excludes) { $zargs += "-xr!$x" }
@@ -639,15 +647,19 @@ jobs:
             & $SevenZip @zargs | Out-Host
             # 7z exit codes: 0 = success, 1 = non-fatal warning, 2 = fatal
             # error. A dangling workspace link can still emit a scan warning
-            # even after Remove-DanglingLinks runs, so only >= 2 is a failure.
+            # even after Flatten-WorkspaceLinks runs, so only >= 2 is a failure.
             if ($LASTEXITCODE -ge 2) { throw "7z failed for $archive (exit $LASTEXITCODE)" }
             $size = [math]::Round((Get-Item "$RootDir\$archive").Length / 1MB, 1)
             Write-Host "✅ $archive ($size MB)"
           }
 
-          # Common release pruning: content the CLI/TUI agent never needs at
-          # runtime. Idempotent, safe to run before tui AND again before gui.
+          # Common release pruning: content the CLI/TUI agent never needs at runtime.
+          # Idempotent, safe to run before tui (Step 7a) AND again before gui (Step 7c).
           function Invoke-CommonPrune {
+            param(
+              [string]$HermesDir,
+              [string]$AgentDir
+            )
             # --- npm prune --omit=dev removes dev dependencies of ALL workspaces
             # (root package.json is an npm workspaces manifest: apps/*, ui-tui,
             # web, tests-js). Runtime deps (agent-browser, ui-tui deps) survive.
@@ -685,20 +697,29 @@ jobs:
               Remove-Item "$HermesDir\$d" -Recurse -Force -ErrorAction SilentlyContinue
             }
 
-            # Pruning workspaces above can leave DANGLING npm workspace links
-            # in the root node_modules (e.g. node_modules\@hermes\root-tests ->
-            # tests-js). Drop them so 7z does not fail its scan.
-            Remove-DanglingLinks
+            # Pruning workspaces above can leave DANGLING npm workspace links in the
+            # root node_modules (e.g. node_modules\@hermes\root-tests -> tests-js).
+            # Flatten EVERY junction/symlink (drop dangling ones, mirror live ones as
+            # real dirs) so 7z does not fail its scan and no absolute build-machine
+            # path leaks into the archive.
+            Flatten-WorkspaceLinks -AgentDir $AgentDir
           }
 
-          function Remove-DanglingLinks {
-            # npm workspaces materialise as junction/symlink entries in the
-            # root node_modules pointing at each workspace dir. Once a workspace
-            # dir is pruned, its link dangles and 7z's scan fails with
-            # "The system cannot find the path specified" (non-zero exit). Walk
-            # the top-level (and @scope) entries and remove any reparse point
-            # whose target no longer exists, using cmd rmdir so the link itself
-            # is deleted without ever following it.
+          function Flatten-WorkspaceLinks {
+            param([string]$AgentDir)
+            # npm workspaces materialise as junction/symlink entries in the root
+            # node_modules pointing at each workspace dir. Instead of only dropping
+            # DANGLING links, scan EVERY top-level (and @scope) entry and FLATTEN each
+            # reparse point so the archive contains plain directories only:
+            #   - target missing (workspace pruned) -> delete the link, so 7z's scan
+            #     does not fail with "The system cannot find the path specified"
+            #     (non-zero exit)
+            #   - target present -> replace the link with a real copy of its target, so
+            #     no build-machine absolute path leaks into the archive (a kept link
+            #     would dangle on the user's machine)
+            # The link itself is removed with cmd rmdir (never followed); robocopy then
+            # mirrors the target's real contents (it follows junctions/symlinks, so
+            # nested links are flattened too).
             $top = @(Get-ChildItem "$AgentDir\node_modules" -Force -Directory -ErrorAction SilentlyContinue)
             $candidates = @()
             foreach ($d in $top) {
@@ -713,51 +734,120 @@ jobs:
               if (-not $c.LinkType) { continue }
               $target = ($c.Target -join '')
               if (-not $target -or -not (Test-Path -LiteralPath $target)) {
+                # Dangling link: drop it so 7z's scan does not fail.
                 & cmd /c "rmdir `"$($c.FullName)`"" 2>$null | Out-Null
+                continue
+              }
+              # Live link: flatten it into a real directory mirroring the target.
+              $link = $c.FullName
+              & cmd /c "rmdir `"$link`"" 2>$null | Out-Null
+              if (Test-Path -LiteralPath $link) { continue }  # rmdir failed; leave as-is
+              New-Item -ItemType Directory -Path $link -Force | Out-Null
+              & robocopy "$target" "$link" /E /COPY:DAT /DCOPY:T /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+              # robocopy exits 0-7 on success (1 = files copied); >=8 is an error.
+              if ($LASTEXITCODE -ge 8) {
+                Write-Warning "Flatten failed for $link (robocopy exit $LASTEXITCODE); removing partial copy"
+                Remove-Item $link -Recurse -Force -ErrorAction SilentlyContinue
               }
             }
           }
+          '@
+          Set-Content -Path "$RootDir\package-helpers.ps1" -Value $helper
+          . "$RootDir\package-helpers.ps1"
 
-          # ── 1/2 TUI archive: plain official install, no desktop GUI ──
+          # ── TUI archive: plain official install, no desktop GUI ──
           if ($buildType -eq "release") {
             Write-Host "Pruning release package (removing non-runtime content)..."
-            Invoke-CommonPrune
+            Invoke-CommonPrune -HermesDir $HermesDir -AgentDir $AgentDir
             Write-Host "✅ Release pruning complete (tui)"
           } else {
             Write-Host "🔧 Debug package: kept as installed, nothing pruned"
           }
-          # The tui archive EXCLUDES the whole apps\ tree (the desktop GUI) and
-          # the .git clone history via 7z -- the files stay on disk so the GUI
-          # build below can still use apps\desktop.
-          New-Package $archiveTui @("hermes-agent\apps", "hermes-agent\.git")
+          # The tui archive EXCLUDES the whole apps\ tree (the desktop GUI)
+          # and the .git clone history via 7z -- the files stay on disk so the
+          # desktop build (Step 7b) can still use apps\desktop.
+          New-Package -RootDir $RootDir -HermesDir $HermesDir -archive $archiveTui -excludes @("hermes-agent\apps", "hermes-agent\.git")
 
-          # ── Build the desktop GUI with the OFFICIAL installer stage ──
-          # "install.ps1 -IncludeDesktop -Stage Desktop" = Install-DesktopVoiceDeps +
-          # Install-Desktop (root npm install incl. Electron, then
-          # electron-builder pack). NOTE: the `desktop` stage is registered in
-          # the stage list ONLY when -IncludeDesktop is passed (official
-          # install.ps1 gates `$InstallStages += desktop` behind it), so both
-          # flags are required together; -Stage alone fails with
-          # "unknown stage". Only the gui archive pays for this build; the tui
-          # archive is already packed.
+          Write-Host "🎁 TUI package:"
+          Write-Host "   $archiveTui"
+          "archive_tui=$archiveTui" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "date_ts=$date" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # ── Step 7b: Install desktop support ───────────────────────
+      # Builds the desktop GUI on demand via the OFFICIAL installer stage
+      # "install.ps1 -IncludeDesktop -Stage Desktop" (Install-DesktopVoiceDeps +
+      # Install-Desktop -> root npm install incl. Electron -> electron-builder
+      # pack -> apps\desktop\release\win-unpacked\Hermes.exe). The stage does
+      # not launch the GUI, so it is CI-safe.
+      #
+      # NOTE: the `desktop` stage is registered in the stage list ONLY when
+      # -IncludeDesktop is passed (official install.ps1 gates
+      # `$InstallStages += desktop` behind it), so both flags are required
+      # together; -Stage alone fails with "unknown stage". Only the GUI
+      # archive (Step 7c) pays for this build; the TUI archive is already
+      # packed in Step 7a.
+      - name: Install desktop support
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $RootDir = "${{ github.workspace }}"
+          $installer = "$RootDir\install.new.ps1"
+
           $env:HERMES_HOME = "$RootDir\hermes"
           Write-Host "Building desktop GUI via install.new.ps1 -IncludeDesktop -Stage Desktop ..."
           & powershell -ExecutionPolicy Bypass -File $installer -IncludeDesktop -Stage Desktop
           if ($LASTEXITCODE -ne 0) {
             throw "install.new.ps1 -IncludeDesktop -Stage Desktop failed with exit code $LASTEXITCODE"
           }
+          Write-Host "✅ Desktop GUI built"
 
-          # ── 2/2 GUI archive: desktop app included ──
+      # ── Step 7c: Package GUI package with 7z ───────────────────
+      # Produces the SECOND archive, the desktop-GUI variant (goals.md):
+      #     hermes_agent-<yyyyMMddHHmmss>-<release|debug>-gui-<version|branch-hash>.7z
+      #
+      # Reuses the SAME <yyyyMMddHHmmss> run id captured in Step 7a so both
+      # archives of this run share one timestamp in their names, and
+      # dot-sources the shared 7z/prune helpers written by Step 7a.
+      #
+      #   gui   - tui install + desktop app built in Step 7b. The gui archive
+      #           keeps apps\desktop\release\win-unpacked\Hermes.exe and
+      #           always drops .git (build-machine clone history).
+      #
+      #   debug   - packaged directly after install, nothing is pruned.
+      #   release - second prune: the desktop build re-ran `npm install`, so
+      #             dev dependencies (incl. Electron) are back; prune them
+      #             again and drop desktop build-time source/intermediate dirs
+      #             (keep win-unpacked).
+      - name: Package GUI package with 7z
+        if: steps.check.outputs.skip != 'true'
+        id: package_gui
+        shell: pwsh
+        run: |
+          $RootDir = "${{ github.workspace }}"
+          $HermesDir = "$RootDir\hermes"
+          $AgentDir = "$HermesDir\hermes-agent"
+          $buildType = "${{ steps.version.outputs.build_type }}"
+          $nameVersion = "${{ steps.naming.outputs.name_version }}"
+
+          # Same run id as the TUI archive (captured in Step 7a) so both
+          # archives of this run share one timestamp.
+          $date = "${{ steps.package_tui.outputs.date_ts }}"
+          $archiveGui = "hermes_agent-$date-$buildType-gui-$nameVersion.7z"
+
+          . "$RootDir\package-helpers.ps1"
+
           if ($buildType -eq "release") {
             # Second prune: the desktop build re-ran `npm install`, so dev
-            # dependencies (incl. Electron) are back; prune them again and drop
-            # desktop build-time source/intermediate dirs (keep win-unpacked).
-            Invoke-CommonPrune
+            # dependencies (incl. Electron) are back; prune them again and
+            # drop desktop build-time source/intermediate dirs (keep
+            # win-unpacked).
+            Write-Host "Pruning release package (removing non-runtime content)..."
+            Invoke-CommonPrune -HermesDir $HermesDir -AgentDir $AgentDir
 
-            # node_modules\hermes is an npm workspace LINK (junction or symlink)
-            # to apps\desktop; Remove-Item -Recurse FOLLOWS reparse points and
-            # would delete the REAL apps\desktop contents, so the link itself is
-            # removed with cmd rmdir (which never recurses).
+            # node_modules\hermes is an npm workspace LINK (junction or
+            # symlink) to apps\desktop; Remove-Item -Recurse FOLLOWS reparse
+            # points and would delete the REAL apps\desktop contents, so the
+            # link itself is removed with cmd rmdir (which never recurses).
             $nmHermes = Get-Item "$AgentDir\node_modules\hermes" -Force -ErrorAction SilentlyContinue
             if ($nmHermes) {
               if ($nmHermes.LinkType) {
@@ -782,6 +872,8 @@ jobs:
               Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
             }
             Write-Host "✅ Release pruning complete (gui)"
+          } else {
+            Write-Host "🔧 Debug package: kept as installed, nothing pruned"
           }
           # The gui archive keeps apps\desktop\release\win-unpacked\Hermes.exe
           # and always drops .git (build-machine clone history, not needed at
@@ -802,12 +894,10 @@ jobs:
               "hermes-agent\apps\desktop\node_modules"
             )
           }
-          New-Package $archiveGui $guiExcludes
+          New-Package -RootDir $RootDir -HermesDir $HermesDir -archive $archiveGui -excludes $guiExcludes
 
-          Write-Host "🎁 Packages:"
-          Write-Host "   $archiveTui"
+          Write-Host "🎁 GUI package:"
           Write-Host "   $archiveGui"
-          "archive_tui=$archiveTui" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "archive_gui=$archiveGui" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # ── Step 8: Upload artifacts ────────────────────────────────
@@ -842,8 +932,8 @@ jobs:
           $buildType = "${{ steps.version.outputs.build_type }}"
           $nameVersion = "${{ steps.naming.outputs.name_version }}"
           $releaseUrl = "${{ steps.version.outputs.releaseUrl }}"
-          $archiveGui = "${{ steps.package.outputs.archive_gui }}"
-          $archiveTui = "${{ steps.package.outputs.archive_tui }}"
+          $archiveGui = "${{ steps.package_gui.outputs.archive_gui }}"
+          $archiveTui = "${{ steps.package_tui.outputs.archive_tui }}"
           $archives = @($archiveGui, $archiveTui)
 
           # Release tag follows goals.md:
