@@ -369,7 +369,25 @@ jobs:
           key: hermes-npm-cache-${{ steps.version.outputs.ref }}
           restore-keys: |
             hermes-npm-cache-
-
+      - name: Recover caches permissions
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $items = @{
+              "hermes/uv-python" = "hermes/uv-python"
+              ".uv-cache" = ".uv-cache"
+              ".npm-cache" = ".npm-cache"
+          }
+          foreach ($path in $items.Keys) {
+              if (Test-Path $path) {
+                  & takeown /F $path /R /A /D Y | Out-Null   # 1) become owner
+                  & icacls  $path /reset /T /C /Q | Out-Null # 2) replace broken DACL with inherited ACEs
+                  & attrib  -R "$path\*" /S /D   | Out-Null  # 3) clear the path's read-only attribute
+                  Write-Host "Restoring permissions for $path"
+              } else {
+                  Write-Warning "Path $path does not exist, skipping permission restoration."
+              }
+          }
       # ── Step 3: Verify and patch install.ps1 ───────────────────
       # Two jobs in one step:
       #   a) Integrity check: compare the repo copy of install.ps1 against the
@@ -460,7 +478,8 @@ jobs:
           Move-Item -Path $innerDir.FullName -Destination "$ToolsDir\ffmpeg"
           Remove-Item "ffmpeg.zip", "$ToolsDir\ffmpeg-tmp" -Recurse -Force
           Write-Host "✅ ffmpeg installed"
-
+          
+          
       # ── Step 5: Install Hermes Agent ────────────────────────────
       # Runs install.new.ps1 (produced by Step 3) inside a minimal, controlled
       # environment:
@@ -484,6 +503,9 @@ jobs:
           #     INSIDE hermes\ so it is captured by the 7z archive
           UV_PYTHON_PREFERENCE: only-managed
           UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}\hermes\uv-python
+          UV_LINK_MODE: copy  # copy uv-managed Python into venv instead of symlinking (symlinks break on Windows) 
+                              # for packaging hermes-agent into a self-contained archive (goals.md: usable immediately 
+                              # after extraction) and solve packaging with 7z bug
           # Redirect package caches INSIDE the workspace so actions/cache
           # (Step 2c) can save/restore them across runs (rules.md: reuse work).
           UV_CACHE_DIR: ${{ github.workspace }}\.uv-cache
