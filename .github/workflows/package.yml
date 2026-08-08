@@ -10,7 +10,7 @@
 #    Step 1b   Skip gate: propagate Step 1's decision; guard against re-runs
 #    Step 2    Check out this repo at the chosen tag/branch
 #    Step 2b   Compute the package name (version or branch-hash)
-#    Step 2c   Restore caches (managed Python, uv cache, npm cache)
+#    Step 2c   Restore caches (npm cache)
 #    Step 3    Verify install.ps1 against the official copy, then patch it
 #    Step 4    Download portable tools (ripgrep, ffmpeg) into hermes\tools
 #    Step 5    Run the patched installer into a clean HERMES_HOME
@@ -340,30 +340,9 @@ jobs:
       # ── Step 2c: Restore caches (rules.md: reuse previous work) ─
       # Caches the slowest, most version-stable build inputs so a re-run of the
       # same ref (or a fix-up build) does not re-download everything:
-      #   - hermes\uv-python  : uv-managed Python interpreters (keyed by ref;
-      #                         restore-keys lets any ref reuse the same 3.11)
-      #   - .uv-cache         : uv wheel/package cache
       #   - .npm-cache        : npm package cache
       # These live INSIDE the workspace so actions/cache can save/restore them
       # without touching anything outside the job.
-      - name: Cache uv-managed Python
-        if: steps.check.outputs.skip != 'true'
-        uses: actions/cache@v6
-        with:
-          path: hermes/uv-python
-          key: hermes-uv-python-${{ steps.version.outputs.ref }}
-          restore-keys: |
-            hermes-uv-python-
-
-      - name: Cache uv package cache
-        if: steps.check.outputs.skip != 'true'
-        uses: actions/cache@v6
-        with:
-          path: .uv-cache
-          key: hermes-uv-cache-${{ steps.version.outputs.ref }}
-          restore-keys: |
-            hermes-uv-cache-
-
       - name: Cache npm cache
         if: steps.check.outputs.skip != 'true'
         uses: actions/cache@v6
@@ -377,8 +356,6 @@ jobs:
         shell: pwsh
         run: |
           $items = @{
-              "hermes/uv-python" = "hermes/uv-python"
-              ".uv-cache" = ".uv-cache"
               ".npm-cache" = ".npm-cache"
           }
           foreach ($path in $items.Keys) {
@@ -511,7 +488,6 @@ jobs:
                               # after extraction) and solve packaging with 7z bug
           # Redirect package caches INSIDE the workspace so actions/cache
           # (Step 2c) can save/restore them across runs (rules.md: reuse work).
-          UV_CACHE_DIR: ${{ github.workspace }}\.uv-cache
           npm_config_cache: ${{ github.workspace }}\.npm-cache
           # Playwright installs its browser engines to %LOCALAPPDATA%\ms-playwright
           # by default, i.e. OUTSIDE hermes\ — they would never reach the archive
@@ -539,7 +515,6 @@ jobs:
           Write-Host "PATH = $env:Path"
           Write-Host "UV_PYTHON_PREFERENCE = $env:UV_PYTHON_PREFERENCE"
           Write-Host "UV_PYTHON_INSTALL_DIR = $env:UV_PYTHON_INSTALL_DIR"
-          Write-Host "UV_CACHE_DIR = $env:UV_CACHE_DIR"
           Write-Host "npm_config_cache = $env:npm_config_cache"
           Write-Host "PLAYWRIGHT_BROWSERS_PATH = $env:PLAYWRIGHT_BROWSERS_PATH"
 
